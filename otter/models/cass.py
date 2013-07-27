@@ -186,6 +186,19 @@ def _build_schedule_policy(policy, event_table, queries, data, polname):
         data[polname + 'cron'] = cron
 
 
+def _update_schedule_policy(connection, policy, policy_id, event_table):
+    # Delete existing entry in event table
+    d = connection.execute(_cql_delete_policy_events.format(cf=self.event_table),
+                           {'policyId': policy_id}, get_consistency_level('delete', 'event'))
+
+    def _insert_event():
+        queries, data = [], {}
+        _build_schedule_policy(policy, event_table, queries, data, 'policy')
+        return Batch(queries, data, get_consistency_level('update', 'event')).execute(connection)
+
+    return d.addCallback(_insert_event)
+
+
 def _build_webhooks(bare_webhooks, webhooks_table, queries, cql_parameters,
                     output):
     """
@@ -539,17 +552,15 @@ class CassScalingGroup(object):
         """
         self.log.bind(updated_policy=data, policy_id=policy_id).msg("Updating policy")
 
-        def _do_update_launch(lastRev):
+        def _do_update_schedule(lastRev):
             if "type" in lastRev:
                 if lastRev["type"] != data["type"]:
                     raise ValidationError("Cannot change type of a scaling policy")
-                # TODO: Fix in https://issues.rax.io/browse/AUTO-467
                 if lastRev["type"] == 'schedule':
-                    if lastRev["args"] != data["args"]:
-                        raise ValidationError("Cannot change scheduled args")
+                    return _update_schedule_policy(self.connection, data, self.event_table)
 
+        def _do_update_policy():
             queries = [_cql_update_policy.format(cf=self.policies_table, name=":policy")]
-
             b = Batch(queries, {"tenantId": self.tenant_id,
                                 "groupId": self.uuid,
                                 "policyId": policy_id,
@@ -559,7 +570,8 @@ class CassScalingGroup(object):
             return d
 
         d = self.get_policy(policy_id)
-        d.addCallback(_do_update_launch)
+        d.addCallback(_do_update_schedule)
+        d.addCallback(_do_update_policy)
         return d
 
     def delete_policy(self, policy_id):
